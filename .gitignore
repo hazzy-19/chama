@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.sqlite3
+.venv/
+venv/
+env/
+*.env
+.env.local
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+
+# IDE/editor
+.vscode/
+.kilo/
+.idea/
+.DS_Store
+
+# Firebase service account
+chama-ceace-firebase-adminsdk-fbsvc-4e02d9694e.json
