@@ -7,6 +7,8 @@ import {
   signOut,
   GoogleAuthProvider,
   signInWithPopup,
+  browserSessionPersistence,
+  setPersistence,
   type User
 } from "firebase/auth";
 import { useEffect, useState } from "react";
@@ -24,12 +26,16 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 
+// Use session-only persistence — users must re-authenticate after logout or tab close
+setPersistence(auth, browserSessionPersistence);
+
 // Auth functions
 export const signUp = (email: string, password: string) => {
   return createUserWithEmailAndPassword(auth, email, password);
 };
 
-export const signIn = (email: string, password: string) => {
+export const signIn = async (email: string, password: string) => {
+  await setPersistence(auth, browserSessionPersistence);
   return signInWithEmailAndPassword(auth, email, password);
 };
 
@@ -43,10 +49,15 @@ export const logOut = () => {
 };
 
 export const useAuth = () => {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(auth.currentUser);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // If auth is already initialized, we can stop loading immediately
+    if (auth.currentUser) {
+      setLoading(false);
+    }
+    
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
       setLoading(false);

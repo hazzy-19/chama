@@ -1,7 +1,9 @@
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.api import api_router
 from app.core.config import settings
+from app.core.tasks import pending_transactions_worker
 from app.db.session import init_db
 
 app = FastAPI(
@@ -20,6 +22,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(api_router, prefix=settings.API_V1_STR)
+
+@app.on_event("startup")
+async def start_pending_worker() -> None:
+    asyncio.create_task(pending_transactions_worker())
 
 @app.get("/")
 def read_root():

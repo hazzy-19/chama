@@ -30,11 +30,13 @@ class Settings(BaseSettings):
     MPESA_SHORTCODE: str
     MPESA_PASSKEY: str
     MPESA_CALLBACK_URL: str
-    
+    MPESA_WHITELIST_CIDRS: str = ""
+
     # WhatsApp
     WHATSAPP_TOKEN: str
     WHATSAPP_PHONE_NUMBER_ID: str
     WHATSAPP_VERIFY_TOKEN: str
+    GUARDIAN_PHONE_NUMBER: str | None = None
     
     class Config:
         case_sensitive = True
