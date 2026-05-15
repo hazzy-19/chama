@@ -49,3 +49,41 @@ export async function requestWithdrawal(amount: number, reason: string) {
   }
   return data;
 }
+
+export async function fetchGoals() {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_BASE}/api/v1/goals`, { headers });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    throw new Error(error.detail || "Unable to load goals.");
+  }
+  return res.json();
+}
+
+export async function createGoal(goalData: { name: string; target_amount: number; target_date: string; color_theme: string }) {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_BASE}/api/v1/goals`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(goalData),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.detail || "Unable to create goal.");
+  }
+  return data;
+}
+
+export async function requestGuardian(guardianData: { name: string; phone_number: string }) {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_BASE}/api/v1/guardians`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(guardianData),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.detail || "Unable to request guardian.");
+  }
+  return data;
+}

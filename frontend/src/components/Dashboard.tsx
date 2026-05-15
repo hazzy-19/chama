@@ -3,10 +3,11 @@ import { useNavigate } from "react-router-dom";
 import { useAuthContext } from "../context/AuthContext";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
-import { LogOut, ShieldCheck, Wallet, ArrowUpRight, ArrowDownLeft, Activity, Info, Clock, AlertCircle, X } from "lucide-react";
+import { LogOut, ShieldCheck, Wallet, ArrowUpRight, ArrowDownLeft, Activity, Info, Clock, AlertCircle, X, Plus, Calendar as CalendarIcon, ChevronDown, Heart } from "lucide-react";
 import { toast } from "sonner";
 import { logOut } from "../services/firebase";
-import { fetchBalance, initiateTopUp, requestWithdrawal } from "../services/api";
+import { fetchBalance, initiateTopUp, requestWithdrawal, fetchGoals } from "../services/api";
+import { StartGoalModal } from "./modals/StartGoalModal";
 import clsx from "clsx";
 
 interface PendingTransaction {
@@ -18,24 +19,54 @@ interface PendingTransaction {
   type: string;
 }
 
+interface Goal {
+  id: string;
+  name: string;
+  target_amount: number;
+  target_date: string;
+  color_theme: string;
+  created_at: string;
+}
+
 const formatCurrency = (value: number) =>
   new Intl.NumberFormat("en-KE", { style: "currency", currency: "KES", maximumFractionDigits: 0 }).format(value);
+
+const THEME_BG: Record<string, string> = {
+  teal: "bg-teal-600", indigo: "bg-indigo-600", rose: "bg-rose-600",
+  emerald: "bg-emerald-600", amber: "bg-amber-600", violet: "bg-violet-600", cyan: "bg-cyan-700"
+};
+
+const THEME_TEXT: Record<string, string> = {
+  teal: "text-teal-600", indigo: "text-indigo-600", rose: "text-rose-600",
+  emerald: "text-emerald-600", amber: "text-amber-600", violet: "text-violet-600", cyan: "text-cyan-700"
+};
 
 const Dashboard = () => {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { user } = useAuthContext();
+  
   const [verificationBannerDismissed, setVerificationBannerDismissed] = useState(false);
+  const [isStartGoalOpen, setIsStartGoalOpen] = useState(false);
+  const [isGoalDropdownOpen, setIsGoalDropdownOpen] = useState(false);
+  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
+
   const [withdrawalAmount, setWithdrawalAmount] = useState("");
   const [requestReason, setRequestReason] = useState("");
   const [depositAmount, setDepositAmount] = useState<number | "">("");
   const [depositPhone, setDepositPhone] = useState("");
+  
   const showVerificationBanner = user && !user.emailVerified && !verificationBannerDismissed && !user.email?.endsWith("@lovely.app");
 
-  const { data: balanceData, isLoading, isFetching } = useQuery({
+  const { data: balanceData, isLoading: isBalanceLoading, isFetching: isBalanceFetching } = useQuery({
     queryKey: ["balance"],
     queryFn: fetchBalance,
     refetchInterval: 30000,
+  });
+
+  const { data: goalsData, isLoading: isGoalsLoading } = useQuery({
+    queryKey: ["goals"],
+    queryFn: fetchGoals,
   });
 
   const topUpMutation = useMutation({
@@ -85,12 +116,25 @@ const Dashboard = () => {
     withdrawMutation.mutate({ amount, reason: requestReason });
   };
 
-  const { real_balance = 0, pending_balance = 0, pending_transactions = [], savings_target = 5000, withdrawal_locked = false } = balanceData || {};
+  const goals = (goalsData as Goal[]) || [];
+  const selectedGoal = goals.find(g => g.id === selectedGoalId) || goals[0] || null;
+  const activeColorTheme = selectedGoal?.color_theme || "teal";
+  const bgClass = THEME_BG[activeColorTheme] || THEME_BG.teal;
+  const textClass = THEME_TEXT[activeColorTheme] || THEME_TEXT.teal;
+
+  const { real_balance = 0, pending_balance = 0, pending_transactions = [], withdrawal_locked = false } = balanceData || {};
   const totalBalance = Number(real_balance) + Number(pending_balance);
-  const progress = Math.min(100, Math.round((totalBalance / Number(savings_target)) * 100));
+  const targetAmount = selectedGoal ? Number(selectedGoal.target_amount) : 5000;
+  const progress = targetAmount > 0 ? Math.min(100, Math.round((totalBalance / targetAmount) * 100)) : 0;
+
+  // Simple virtual pet health logic: happy if no pending withdrawals and progress > 0
+  const hasPendingWithdrawals = (pending_transactions as PendingTransaction[]).some(tx => tx.type === 'withdrawal');
+  const petMood = hasPendingWithdrawals ? "worried" : progress > 0 ? "happy" : "neutral";
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-primary/20">
+      <StartGoalModal isOpen={isStartGoalOpen} onClose={() => setIsStartGoalOpen(false)} />
+      
       {/* Email Verification Banner */}
       <AnimatePresence>
         {showVerificationBanner && (
@@ -117,11 +161,11 @@ const Dashboard = () => {
       </AnimatePresence>
 
       {/* Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-10 backdrop-blur-md bg-white/80">
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-20 backdrop-blur-md bg-white/80">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="bg-primary p-1.5 rounded-lg">
-              <ShieldCheck className="w-5 h-5 text-white" />
+            <div className={clsx("p-1.5 rounded-lg text-white transition-colors", bgClass)}>
+              <ShieldCheck className="w-5 h-5" />
             </div>
             <h1 className="text-xl font-extrabold tracking-tight text-slate-900">Lovely</h1>
           </div>
@@ -145,45 +189,101 @@ const Dashboard = () => {
         {/* Top Section */}
         <section className="grid lg:grid-cols-[1fr_400px] gap-8">
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-8">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between relative">
               <div>
-                <p className="text-sm font-semibold uppercase tracking-wider text-primary flex items-center gap-2">
+                <p className={clsx("text-sm font-semibold uppercase tracking-wider flex items-center gap-2", textClass)}>
                   Overview
-                  {(isLoading || isFetching) && (
-                    <Activity className="w-4 h-4 animate-spin text-primary opacity-70" />
+                  {(isBalanceLoading || isBalanceFetching || isGoalsLoading) && (
+                    <Activity className="w-4 h-4 animate-spin opacity-70" />
                   )}
                 </p>
-                <h2 className="text-3xl font-semibold mt-1">Your Savings Goal</h2>
+                <button 
+                  onClick={() => setIsStartGoalOpen(true)}
+                  className="mt-2 flex items-center gap-2 text-3xl font-semibold hover:opacity-80 transition-opacity"
+                >
+                  <Plus className={clsx("w-8 h-8", textClass)} />
+                  Start Goal
+                </button>
               </div>
-              <div className="bg-danger/10 text-danger px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4" /> Guardian Mode Active
+
+              {/* Goals Dropdown */}
+              <div className="relative">
+                <button 
+                  onClick={() => setIsGoalDropdownOpen(!isGoalDropdownOpen)}
+                  className={clsx("px-4 py-2 rounded-full text-sm font-semibold flex items-center gap-2 transition-colors border shadow-sm", bgClass, "text-white hover:opacity-90")}
+                >
+                  <CalendarIcon className="w-4 h-4" /> 
+                  {selectedGoal ? selectedGoal.name : "My Goals"}
+                  <ChevronDown className="w-4 h-4 ml-1" />
+                </button>
+                
+                <AnimatePresence>
+                  {isGoalDropdownOpen && (
+                    <motion.div 
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 10 }}
+                      className="absolute right-0 mt-2 w-64 bg-white border border-slate-200 shadow-xl rounded-2xl overflow-hidden z-30"
+                    >
+                      <div className="p-3 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
+                        <CalendarIcon className="w-4 h-4 text-slate-500" />
+                        <span className="text-sm font-semibold text-slate-700">Goals Calendar</span>
+                      </div>
+                      <div className="max-h-64 overflow-y-auto">
+                        {goals.length === 0 ? (
+                          <p className="text-center text-sm text-slate-500 py-6">No goals found.</p>
+                        ) : (
+                          goals.map(g => (
+                            <button
+                              key={g.id}
+                              onClick={() => {
+                                setSelectedGoalId(g.id);
+                                setIsGoalDropdownOpen(false);
+                              }}
+                              className={clsx(
+                                "w-full text-left px-4 py-3 border-b border-slate-50 hover:bg-slate-50 transition-colors flex flex-col gap-1",
+                                selectedGoalId === g.id && "bg-slate-50"
+                              )}
+                            >
+                              <div className="flex justify-between items-center">
+                                <span className="font-medium text-slate-900">{g.name}</span>
+                                <div className={clsx("w-3 h-3 rounded-full", THEME_BG[g.color_theme] || THEME_BG.teal)} />
+                              </div>
+                              <span className="text-xs text-slate-500">{g.target_date}</span>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             </div>
 
             <div className="grid sm:grid-cols-2 gap-6">
-              {/* Balance Card */}
-              <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-200 relative overflow-hidden group">
-                <div className="absolute top-0 right-0 p-6 opacity-5 group-hover:opacity-10 transition-opacity">
-                  <Wallet className="w-24 h-24" />
-                </div>
-                <p className="text-sm font-medium text-slate-500">Available Balance</p>
-                <p className="text-5xl font-semibold mt-2 tracking-tight">{formatCurrency(Number(real_balance))}</p>
-                {Number(pending_balance) > 0 && (
-                  <div className="mt-4 inline-flex items-center gap-2 bg-amber-50 text-amber-700 px-3 py-1.5 rounded-full text-sm font-medium">
-                    <Clock className="w-4 h-4" />
-                    +{formatCurrency(Number(pending_balance))} pending
-                  </div>
-                )}
-              </div>
-
-              {/* Progress Card */}
-              <div className="bg-gradient-to-br from-primary to-teal-800 rounded-3xl p-8 shadow-soft text-white relative overflow-hidden">
+              {/* Target / Progress Card with Pet */}
+              <div className={clsx("rounded-3xl p-8 shadow-soft text-white relative overflow-hidden transition-colors duration-500", bgClass)}>
                 <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-10 mix-blend-overlay"></div>
-                <p className="text-sm font-medium text-teal-100">Savings Target</p>
-                <p className="text-5xl font-semibold mt-2 tracking-tight">{formatCurrency(Number(savings_target))}</p>
+                
+                <div className="flex justify-between items-start relative z-10">
+                  <div>
+                    <p className="text-sm font-medium text-white/80">{selectedGoal ? selectedGoal.name : "Savings Target"}</p>
+                    <p className="text-4xl lg:text-5xl font-semibold mt-2 tracking-tight">{formatCurrency(targetAmount)}</p>
+                  </div>
+                  {/* Virtual Pet */}
+                  <div className="bg-white/20 p-3 rounded-2xl backdrop-blur-sm flex flex-col items-center justify-center shadow-inner">
+                    <span className="text-3xl" title={`Pet is ${petMood}`}>
+                      {petMood === "happy" ? "🐶" : petMood === "worried" ? "😿" : "🐱"}
+                    </span>
+                    <div className="flex gap-1 mt-1">
+                      <Heart className={clsx("w-3 h-3", petMood === "happy" ? "text-red-400 fill-red-400" : "text-white/50")} />
+                      <Heart className={clsx("w-3 h-3", petMood === "happy" ? "text-red-400 fill-red-400" : "text-white/50")} />
+                    </div>
+                  </div>
+                </div>
                 
                 <div className="mt-8 space-y-2 relative z-10">
-                  <div className="flex justify-between text-sm font-medium text-teal-100">
+                  <div className="flex justify-between text-sm font-medium text-white/90">
                     <span>Progress</span>
                     <span>{progress}%</span>
                   </div>
@@ -195,8 +295,56 @@ const Dashboard = () => {
                       className="h-full bg-white rounded-full"
                     />
                   </div>
+                  {selectedGoal && (
+                    <p className="text-xs text-white/80 mt-2 text-right">Target Date: {selectedGoal.target_date}</p>
+                  )}
                 </div>
               </div>
+
+              {/* Available Balance & Deposit Card */}
+              <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-200 relative overflow-hidden group flex flex-col">
+                <div className="absolute top-0 right-0 p-6 opacity-5 group-hover:opacity-10 transition-opacity">
+                  <Wallet className="w-24 h-24" />
+                </div>
+                <p className="text-sm font-medium text-slate-500 relative z-10">Available Balance</p>
+                <p className="text-4xl lg:text-5xl font-semibold mt-2 tracking-tight relative z-10">{formatCurrency(Number(real_balance))}</p>
+                {Number(pending_balance) > 0 && (
+                  <div className="mt-2 inline-flex items-center gap-2 bg-amber-50 text-amber-700 px-3 py-1.5 rounded-full text-sm font-medium relative z-10 self-start">
+                    <Clock className="w-4 h-4" />
+                    +{formatCurrency(Number(pending_balance))} pending
+                  </div>
+                )}
+
+                <div className="mt-auto pt-6 border-t border-slate-100 relative z-10 space-y-4">
+                  <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                    <ArrowDownLeft className="w-4 h-4" /> Quick Deposit
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="number"
+                      value={depositAmount}
+                      onChange={(e) => setDepositAmount(e.target.value ? Number(e.target.value) : "")}
+                      placeholder="Amount"
+                      className="w-1/3 px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                    />
+                    <input
+                      type="tel"
+                      value={depositPhone}
+                      onChange={(e) => setDepositPhone(e.target.value)}
+                      placeholder="Phone (2547...)"
+                      className="flex-1 px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                    />
+                  </div>
+                  <button
+                    onClick={handleTopUp}
+                    disabled={topUpMutation.isPending}
+                    className={clsx("w-full text-white font-medium py-2.5 rounded-xl transition-all active:scale-[0.98] disabled:opacity-70 flex justify-center items-center gap-2 text-sm", bgClass)}
+                  >
+                    {topUpMutation.isPending ? <Activity className="w-4 h-4 animate-spin" /> : "Initiate STK Push"}
+                  </button>
+                </div>
+              </div>
+
             </div>
           </motion.div>
 
@@ -222,8 +370,8 @@ const Dashboard = () => {
                       className="p-4 rounded-2xl bg-slate-50 border border-slate-100 flex items-start gap-4"
                     >
                       <div className={clsx(
-                        "p-2 rounded-xl", 
-                        tx.type === "deposit" ? "bg-primary/10 text-primary" : "bg-danger/10 text-danger"
+                        "p-2 rounded-xl text-white", 
+                        tx.type === "deposit" ? bgClass : "bg-rose-500"
                       )}>
                         {tx.type === "deposit" ? <ArrowDownLeft className="w-5 h-5" /> : <ArrowUpRight className="w-5 h-5" />}
                       </div>
@@ -246,51 +394,10 @@ const Dashboard = () => {
 
         {/* Action Section */}
         <section className="grid md:grid-cols-2 gap-8">
-          {/* Deposit Card */}
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }} className="bg-white rounded-3xl p-8 shadow-sm border border-slate-200">
-            <div className="flex items-center gap-3 mb-8">
-              <div className="p-3 bg-surface2 text-primary rounded-2xl"><ArrowDownLeft className="w-6 h-6" /></div>
-              <div>
-                <h3 className="text-xl font-semibold">Deposit Funds</h3>
-                <p className="text-sm text-slate-500">Add to your savings via M-Pesa</p>
-              </div>
-            </div>
-
-            <div className="space-y-5">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Amount (KES)</label>
-                <input
-                  type="number"
-                  value={depositAmount}
-                  onChange={(e) => setDepositAmount(e.target.value ? Number(e.target.value) : "")}
-                  placeholder="e.g. 500"
-                  className="w-full px-4 py-3 rounded-2xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">M-Pesa Phone Number</label>
-                <input
-                  type="tel"
-                  value={depositPhone}
-                  onChange={(e) => setDepositPhone(e.target.value)}
-                  placeholder="2547XXXXXXXX"
-                  className="w-full px-4 py-3 rounded-2xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-                />
-              </div>
-              <button
-                onClick={handleTopUp}
-                disabled={topUpMutation.isPending}
-                className="w-full bg-primary hover:bg-teal-700 text-white font-medium py-3.5 rounded-2xl transition-all active:scale-[0.98] disabled:opacity-70 flex justify-center items-center gap-2"
-              >
-                {topUpMutation.isPending ? <Activity className="w-5 h-5 animate-spin" /> : "Initiate STK Push"}
-              </button>
-            </div>
-          </motion.div>
-
           {/* Withdraw Card */}
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="bg-white rounded-3xl p-8 shadow-sm border border-slate-200">
             <div className="flex items-center gap-3 mb-8">
-              <div className="p-3 bg-danger/10 text-danger rounded-2xl"><ArrowUpRight className="w-6 h-6" /></div>
+              <div className="p-3 bg-rose-100 text-rose-600 rounded-2xl"><ArrowUpRight className="w-6 h-6" /></div>
               <div>
                 <h3 className="text-xl font-semibold">Request Withdrawal</h3>
                 <p className="text-sm text-slate-500">Requires Guardian approval</p>
@@ -314,7 +421,7 @@ const Dashboard = () => {
                     value={withdrawalAmount}
                     onChange={(e) => setWithdrawalAmount(e.target.value)}
                     placeholder="e.g. 1000"
-                    className="w-full px-4 py-3 rounded-2xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-danger/20 focus:border-danger transition-all"
+                    className="w-full px-4 py-3 rounded-2xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-rose-500/20 focus:border-rose-500 transition-all"
                   />
                 </div>
                 <div>
@@ -324,13 +431,13 @@ const Dashboard = () => {
                     value={requestReason}
                     onChange={(e) => setRequestReason(e.target.value)}
                     placeholder="Why do you need to withdraw?"
-                    className="w-full px-4 py-3 rounded-2xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-danger/20 focus:border-danger transition-all resize-none"
+                    className="w-full px-4 py-3 rounded-2xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-rose-500/20 focus:border-rose-500 transition-all resize-none"
                   />
                 </div>
                 <button
                   onClick={handleWithdraw}
                   disabled={withdrawMutation.isPending}
-                  className="w-full bg-danger hover:bg-red-700 text-white font-medium py-3.5 rounded-2xl transition-all active:scale-[0.98] disabled:opacity-70 flex justify-center items-center gap-2"
+                  className="w-full bg-rose-600 hover:bg-rose-700 text-white font-medium py-3.5 rounded-2xl transition-all active:scale-[0.98] disabled:opacity-70 flex justify-center items-center gap-2"
                 >
                   {withdrawMutation.isPending ? <Activity className="w-5 h-5 animate-spin" /> : "Request via WhatsApp"}
                 </button>

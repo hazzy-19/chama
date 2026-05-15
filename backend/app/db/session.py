@@ -11,6 +11,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 def init_db():
+    import app.models.user
+    import app.models.transaction
+    import app.models.goal
+    import app.models.guardian
     Base.metadata.create_all(bind=engine)
 
 def get_db():

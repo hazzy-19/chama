@@ -14,6 +14,8 @@ from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.models.transaction import Transaction
 from app.models.user import User
+from app.models.goal import Goal
+from app.models.guardian import Guardian
 from app.schemas.transaction import (
     BalanceResponse,
     GenericResponse,
@@ -23,6 +25,8 @@ from app.schemas.transaction import (
     TransactionRead,
     WithdrawalRequest,
 )
+from app.schemas.goal import GoalCreate, GoalRead
+from app.schemas.guardian import GuardianCreate, GuardianRead
 
 api_router = APIRouter()
 
@@ -281,6 +285,56 @@ def get_user_balance(current_user: User = Depends(get_current_user), db: Session
         withdrawal_locked=pending_balance > 0,
     )
 
+@api_router.post("/goals", response_model=GoalRead)
+def create_goal(goal_in: GoalCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    goal = Goal(**goal_in.dict(), user_id=current_user.id)
+    db.add(goal)
+    db.commit()
+    db.refresh(goal)
+    return goal
+
+@api_router.get("/goals", response_model=list[GoalRead])
+def list_goals(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    goals = db.query(Goal).filter(Goal.user_id == current_user.id).order_by(Goal.created_at.desc()).all()
+    return goals
+
+@api_router.post("/guardians", response_model=GenericResponse)
+async def request_guardian(guardian_in: GuardianCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.phone_number and guardian_in.phone_number == current_user.phone_number:
+        raise HTTPException(status_code=400, detail="You cannot be your own guardian.")
+    
+    # Check if a guardian already exists for this number and user
+    existing = db.query(Guardian).filter(Guardian.user_id == current_user.id, Guardian.phone_number == guardian_in.phone_number).first()
+    if existing:
+        return GenericResponse(detail="Guardian already requested or active.")
+
+    guardian = Guardian(**guardian_in.dict(), user_id=current_user.id)
+    db.add(guardian)
+    db.commit()
+    db.refresh(guardian)
+
+    if settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID:
+        whatsapp_payload = {
+            "messaging_product": "whatsapp",
+            "to": guardian.phone_number,
+            "type": "text",
+            "text": {
+                "body": f"Hello {guardian.name}, {current_user.email} has requested you to be their savings guardian on Lovely! As a guardian, you will approve or decline their withdrawal requests. Reply YES to accept."
+            },
+        }
+        async with httpx.AsyncClient() as client:
+            try:
+                await client.post(
+                    f"https://graph.facebook.com/v16.0/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages",
+                    json=whatsapp_payload,
+                    headers={"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}", "Content-Type": "application/json"},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+                
+    return GenericResponse(detail="Guardian requested successfully.")
+
 @api_router.post("/withdrawals", response_model=GenericResponse)
 async def create_withdrawal_request(
     withdrawal: WithdrawalRequest,
@@ -338,27 +392,39 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             return {"status": "ignored"}
         
         message_body = messages[0].get("text", {}).get("body", "").strip().lower()
+        sender_phone = messages[0].get("from", "")
         
-        # Find the latest pending withdrawal
+        # Check if this is a guardian acceptance
+        if message_body in ["yes", "accept", "y"]:
+            pending_guardian = db.query(Guardian).filter(
+                # We do a basic LIKE match because the from number might have a country code
+                Guardian.phone_number.like(f"%{sender_phone[-9:]}%"),
+                Guardian.status == "pending"
+            ).order_by(Guardian.created_at.desc()).first()
+            
+            if pending_guardian:
+                pending_guardian.status = "accepted"
+                db.commit()
+                return {"status": "guardian accepted"}
+        
+        # Check if it's a withdrawal approval
         pending_withdrawal = db.query(Transaction).filter(
             Transaction.type == "withdrawal",
             Transaction.status == "pending_approval"
         ).order_by(Transaction.created_at.desc()).first()
         
-        if not pending_withdrawal:
-            return {"status": "no pending withdrawals"}
-            
-        if message_body in ["yes", "approve", "y"]:
-            pending_withdrawal.status = "confirmed"
-            pending_withdrawal.guardian_approved = "approved"
-            pending_withdrawal.verified = True
-            db.commit()
-            return {"status": "approved"}
-        elif message_body in ["no", "decline", "n"]:
-            pending_withdrawal.status = "failed"
-            pending_withdrawal.guardian_approved = "declined"
-            db.commit()
-            return {"status": "declined"}
+        if pending_withdrawal:
+            if message_body in ["yes", "approve", "y"]:
+                pending_withdrawal.status = "confirmed"
+                pending_withdrawal.guardian_approved = "approved"
+                pending_withdrawal.verified = True
+                db.commit()
+                return {"status": "withdrawal approved"}
+            elif message_body in ["no", "decline", "n"]:
+                pending_withdrawal.status = "failed"
+                pending_withdrawal.guardian_approved = "declined"
+                db.commit()
+                return {"status": "withdrawal declined"}
             
     except Exception:
         pass
