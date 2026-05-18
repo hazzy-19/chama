@@ -29,8 +29,11 @@ class Settings(BaseSettings):
     MPESA_CONSUMER_SECRET: str
     MPESA_SHORTCODE: str
     MPESA_PASSKEY: str
-    MPESA_CALLBACK_URL: str
+    MPESA_CALLBACK_URL: str = ""
     MPESA_WHITELIST_CIDRS: str = ""
+    NGROK_URL: str = ""
+    APP_DOMAIN_URL: str = ""
+    APP_ENV: str = "development"
 
     # WhatsApp
     WHATSAPP_TOKEN: str

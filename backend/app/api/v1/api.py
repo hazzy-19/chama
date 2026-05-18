@@ -1,16 +1,19 @@
 import ipaddress
 import json
-import time
 from uuid import uuid4
 from decimal import Decimal
 
 import httpx
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+import logging
 
 from app.core.config import settings
+from app.core.mpesa import mpesa_client, MpesaAPIError, ValidationError
 from app.db.session import SessionLocal, get_db
 from app.models.transaction import Transaction
 from app.models.user import User
@@ -21,6 +24,7 @@ from app.schemas.transaction import (
     GenericResponse,
     MpesaInitRequest,
     MpesaInitiateResponse,
+    StkStatusResponse,
     TransactionCreate,
     TransactionRead,
     WithdrawalRequest,
@@ -28,35 +32,71 @@ from app.schemas.transaction import (
 from app.schemas.goal import GoalCreate, GoalRead
 from app.schemas.guardian import GuardianCreate, GuardianRead
 
+logger = logging.getLogger("app.api.v1")
+
+# ---------------------------------------------------------------------------
+# Firebase Admin SDK — initialise once at import time
+# ---------------------------------------------------------------------------
+if not firebase_admin._apps:
+    _cred = credentials.Certificate({
+        "type": "service_account",
+        "project_id": settings.FIREBASE_PROJECT_ID,
+        "private_key_id": settings.FIREBASE_PRIVATE_KEY_ID,
+        "private_key": settings.FIREBASE_PRIVATE_KEY.replace("\\n", "\n"),
+        "client_email": settings.FIREBASE_CLIENT_EMAIL,
+        "client_id": settings.FIREBASE_CLIENT_ID,
+        "auth_uri": settings.FIREBASE_AUTH_URI,
+        "token_uri": settings.FIREBASE_TOKEN_URI,
+        "auth_provider_x509_cert_url": settings.FIREBASE_AUTH_PROVIDER_X509_CERT_URL,
+        "client_x509_cert_url": settings.FIREBASE_CLIENT_X509_CERT_URL,
+    })
+    firebase_admin.initialize_app(_cred)
+
 api_router = APIRouter()
 
-MPESA_OAUTH_URL = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
-MPESA_STATUS_URL = "https://sandbox.safaricom.co.ke/mpesa/transactionstatus/v1/query"
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
 
-_mpesa_token_cache = {"token": None, "expires_at": 0}
+def verify_id_token(id_token: str) -> dict:
+    """Verify a Firebase ID token using the Admin SDK."""
+    try:
+        return firebase_auth.verify_id_token(id_token)
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired. Please log in again.",
+        )
+    except firebase_auth.InvalidIdTokenError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {e}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token verification failed: {e}",
+        )
 
-async def verify_id_token(id_token: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        response = await client.get("https://oauth2.googleapis.com/tokeninfo", params={"id_token": id_token}, timeout=10)
-        if response.status_code != 200:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization token")
-        payload = response.json()
-        if payload.get("aud") != settings.FIREBASE_CLIENT_ID:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token audience mismatch")
-        return payload
 
 async def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authorization header")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization header",
+        )
 
     token = auth_header.removeprefix("Bearer ").strip()
-    payload = await verify_id_token(token)
+    payload = verify_id_token(token)  # now synchronous — no await needed
 
-    firebase_uid = payload.get("sub")
+    firebase_uid = payload.get("uid")   # Admin SDK uses 'uid', not 'sub'
     email = payload.get("email")
     if not firebase_uid or not email:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth payload")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid auth payload",
+        )
 
     user = db.query(User).filter(User.id == firebase_uid).first()
     if not user:
@@ -72,155 +112,127 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
 
     return user
 
-def validate_mpesa_source_ip(request: Request) -> None:
-    raw_cidrs = settings.MPESA_WHITELIST_CIDRS
-    if not raw_cidrs:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="M-Pesa whitelist is not configured")
+# ---------------------------------------------------------------------------
+# Balance helper
+# ---------------------------------------------------------------------------
 
-    client_host = request.client.host if request.client else None
-    if not client_host:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unable to determine callback source")
+def calculate_balance(
+    db: Session, user_id: str
+) -> tuple[Decimal, Decimal, list[Transaction]]:
+    deposits = (
+        db.query(func.sum(Transaction.amount))
+        .filter(
+            Transaction.user_id == user_id,
+            Transaction.status == "confirmed",
+            Transaction.verified == True,
+            Transaction.type == "deposit",
+        )
+        .scalar()
+        or Decimal("0.0")
+    )
 
-    try:
-        remote_ip = ipaddress.ip_address(client_host)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid callback IP address")
-
-    for cidr in [cidr.strip() for cidr in raw_cidrs.split(",") if cidr.strip()]:
-        try:
-            network = ipaddress.ip_network(cidr, strict=False)
-        except ValueError:
-            continue
-        if remote_ip in network:
-            return
-
-    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Callback IP is not authorized")
-
-async def get_mpesa_access_token() -> str | None:
-    if not settings.MPESA_CONSUMER_KEY or not settings.MPESA_CONSUMER_SECRET:
-        return None
-
-    if _mpesa_token_cache["token"] and time.time() < _mpesa_token_cache["expires_at"]:
-        return _mpesa_token_cache["token"]
-
-    async with httpx.AsyncClient() as client:
-        try:
-            token_response = await client.get(MPESA_OAUTH_URL, auth=(settings.MPESA_CONSUMER_KEY, settings.MPESA_CONSUMER_SECRET), timeout=10)
-            if token_response.status_code == 200:
-                data = token_response.json()
-                _mpesa_token_cache["token"] = data.get("access_token")
-                _mpesa_token_cache["expires_at"] = time.time() + 3500
-                return _mpesa_token_cache["token"]
-        except Exception:
-            pass
-    return None
-
-async def query_mpesa_transaction_status(mpesa_receipt_number: str) -> dict | None:
-    access_token = await get_mpesa_access_token()
-    if not access_token or not mpesa_receipt_number:
-        return None
-
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    payload = {
-        "CommandID": "TransactionStatusQuery",
-        "PartyA": settings.MPESA_SHORTCODE,
-        "IdentifierType": "4",
-        "Remarks": "Status check",
-        "QueueTimeOutURL": settings.MPESA_CALLBACK_URL,
-        "ResultURL": settings.MPESA_CALLBACK_URL,
-        "TransactionID": mpesa_receipt_number,
-    }
-
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(MPESA_STATUS_URL, json=payload, headers=headers, timeout=10)
-            if response.status_code == 200:
-                return response.json()
-        except Exception:
-            pass
-    return None
-
-async def process_pending_transaction(transaction_id: str, callback_payload: dict | None = None) -> None:
-    db = SessionLocal()
-    try:
-        transaction = db.query(Transaction).filter(Transaction.transaction_id == transaction_id).first()
-        if not transaction or transaction.verified or transaction.status == "failed":
-            return
-
-        confirmed = False
-        if callback_payload and str(callback_payload.get("ResultCode", "")) == "0":
-            amount = callback_payload.get("Amount") or callback_payload.get("amount")
-            if amount is not None and float(amount) == float(transaction.amount):
-                confirmed = True
-
-        if not confirmed:
-            status_payload = await query_mpesa_transaction_status(transaction.mpesa_receipt_number or "")
-            if status_payload:
-                transaction_status = status_payload.get("TransactionStatus") or status_payload.get("ResultCode")
-                amount = status_payload.get("Amount") or status_payload.get("amount")
-                if str(transaction_status).lower() in {"completed", "0", "success"} and amount is not None and float(amount) == float(transaction.amount):
-                    confirmed = True
-                else:
-                    transaction.status = "failed"
-                    transaction.verified = False
-                    db.commit()
-                    return
-
-        if confirmed:
-            transaction.status = "confirmed"
-            transaction.verified = True
-            db.commit()
-    finally:
-        db.close()
-
-def calculate_balance(db: Session, user_id: str) -> tuple[Decimal, Decimal, list[Transaction]]:
-    deposits = db.query(func.sum(Transaction.amount)).filter(
-        Transaction.user_id == user_id, 
-        Transaction.status == "confirmed", 
-        Transaction.verified == True,
-        Transaction.type == "deposit"
-    ).scalar() or Decimal("0.0")
-
-    withdrawals = db.query(func.sum(Transaction.amount)).filter(
-        Transaction.user_id == user_id, 
-        Transaction.status.in_(["confirmed", "pending_approval"]),
-        Transaction.type == "withdrawal"
-    ).scalar() or Decimal("0.0")
+    withdrawals = (
+        db.query(func.sum(Transaction.amount))
+        .filter(
+            Transaction.user_id == user_id,
+            Transaction.status.in_(["confirmed", "pending_approval"]),
+            Transaction.type == "withdrawal",
+        )
+        .scalar()
+        or Decimal("0.0")
+    )
 
     real_balance = Decimal(deposits) - Decimal(withdrawals)
-    
-    pending_deposits = db.query(func.sum(Transaction.amount)).filter(
-        Transaction.user_id == user_id,
-        Transaction.status == "pending",
-        Transaction.type == "deposit"
-    ).scalar() or Decimal("0.0")
 
-    pending_transactions = db.query(Transaction).filter(
-        Transaction.user_id == user_id,
-        Transaction.status.in_(["pending", "pending_approval"])
-    ).order_by(Transaction.created_at.desc()).all()
+    pending_deposits = (
+        db.query(func.sum(Transaction.amount))
+        .filter(
+            Transaction.user_id == user_id,
+            Transaction.status == "pending",
+            Transaction.type == "deposit",
+        )
+        .scalar()
+        or Decimal("0.0")
+    )
+
+    pending_transactions = (
+        db.query(Transaction)
+        .filter(
+            Transaction.user_id == user_id,
+            Transaction.status.in_(["pending", "pending_approval"]),
+        )
+        .order_by(Transaction.created_at.desc())
+        .all()
+    )
 
     return real_balance, Decimal(pending_deposits), pending_transactions
+
+# ---------------------------------------------------------------------------
+# Utility endpoints
+# ---------------------------------------------------------------------------
 
 @api_router.get("/test", status_code=200)
 def test():
     return {"message": "Test endpoint is working"}
 
-@api_router.post("/mpesa/initiate", response_model=MpesaInitiateResponse, status_code=status.HTTP_201_CREATED)
-def initiate_mpesa_stk_push(
+# ---------------------------------------------------------------------------
+# M-Pesa — Initiate STK Push
+# ---------------------------------------------------------------------------
+
+@api_router.post(
+    "/mpesa/initiate",
+    response_model=MpesaInitiateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def initiate_mpesa_stk_push(
     init_request: MpesaInitRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """
+    Validate inputs, call Safaricom's STK Push API, and persist a pending
+    transaction record. Returns the CheckoutRequestID so the frontend can poll
+    for the result.
+    """
+    # Validate phone & amount eagerly so we surface errors before hitting Safaricom
+    try:
+        formatted_phone = mpesa_client.validate_phone(str(init_request.phone))
+        mpesa_client.validate_amount(float(init_request.amount))
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+    # Generate an internal transaction ID (used as AccountReference if none provided)
     transaction_id = f"stk_{uuid4().hex}"
+
+    # Actually call Safaricom
+    try:
+        safaricom_resp = await mpesa_client.initiate_stk_push(
+            phone=formatted_phone,
+            amount=float(init_request.amount),
+            transaction_id=transaction_id,
+            account_reference=transaction_id,
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except MpesaAPIError as exc:
+        logger.error("Safaricom STK Push failed: %s", exc.message)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"M-Pesa error: {exc.message}",
+        )
+
+    checkout_request_id = safaricom_resp["CheckoutRequestID"]
+
+    # Persist a "pending" record — status will be updated via callback
     db_transaction = Transaction(
         transaction_id=transaction_id,
+        checkout_request_id=checkout_request_id,
         user_id=current_user.id,
-        phone=init_request.phone,
+        phone=formatted_phone,
         amount=init_request.amount,
         type="deposit",
         currency="KSH",
-        status="initiated",
+        status="pending",
         verified=False,
         description=init_request.description,
     )
@@ -230,52 +242,198 @@ def initiate_mpesa_stk_push(
         db.refresh(db_transaction)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Unable to create STK Push initiation.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Transaction record conflict — please try again.",
+        )
 
-    return MpesaInitiateResponse(
-        transaction_id=db_transaction.transaction_id,
-        amount=db_transaction.amount,
-        phone=db_transaction.phone or init_request.phone,
-        status=db_transaction.status,
-        message="STK Push initiated. Awaiting Safaricom callback for confirmation.",
+    logger.info(
+        "STK Push initiated. transaction_id=%s checkout_request_id=%s",
+        transaction_id,
+        checkout_request_id,
     )
 
-@api_router.post("/mpesa/callback", response_model=GenericResponse, status_code=status.HTTP_202_ACCEPTED)
+    return MpesaInitiateResponse(
+        transaction_id=transaction_id,
+        checkout_request_id=checkout_request_id,
+        amount=db_transaction.amount,
+        phone=formatted_phone,
+        status="pending",
+        message="STK Push sent. Check your phone and enter your M-Pesa PIN.",
+    )
+
+# ---------------------------------------------------------------------------
+# M-Pesa — Callback from Safaricom
+# ---------------------------------------------------------------------------
+
+@api_router.post("/mpesa/callback", status_code=status.HTTP_200_OK)
 async def mpesa_callback(
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    validate_mpesa_source_ip(request)
-    payload = await request.json()
-    if not payload:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid callback payload")
+    """
+    Receive the STK Push result from Safaricom.
 
-    checkout_request_id = payload.get("CheckoutRequestID") or payload.get("checkout_request_id")
-    receipt = payload.get("MpesaReceiptNumber") or payload.get("mpesa_receipt_number")
-    if not checkout_request_id or not receipt:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Callback payload missing required identifiers")
+    Safaricom expects us to always return {"ResultCode": 0, "ResultDesc": "Success"}
+    even if we encounter an internal error — otherwise it retries indefinitely.
 
-    existing_receipt = db.query(Transaction).filter(Transaction.mpesa_receipt_number == receipt).first()
-    if existing_receipt and existing_receipt.transaction_id != checkout_request_id:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Duplicate receipt number detected")
+    Result codes:
+        0    — success
+        1032 — cancelled by user
+        any other — failed (e.g. wrong PIN, insufficient funds)
+    """
+    # Always ack Safaricom successfully
+    ack = {"ResultCode": 0, "ResultDesc": "Success"}
 
-    transaction = db.query(Transaction).filter(Transaction.transaction_id == checkout_request_id).first()
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("mpesa_callback: could not parse request body")
+        return ack
+
+    logger.info("mpesa_callback raw payload: %s", json.dumps(payload))
+
+    try:
+        body = payload.get("Body", {})
+        stk_callback = body.get("stkCallback", {})
+
+        if not stk_callback:
+            logger.error("mpesa_callback: no stkCallback key in payload")
+            return ack
+
+        checkout_id = stk_callback.get("CheckoutRequestID")
+        result_code = stk_callback.get("ResultCode")   # int
+        result_desc = stk_callback.get("ResultDesc", "")
+
+        if not checkout_id:
+            logger.error("mpesa_callback: no CheckoutRequestID in payload")
+            return ack
+
+        # Find the transaction by Safaricom's CheckoutRequestID
+        transaction = (
+            db.query(Transaction)
+            .filter(Transaction.checkout_request_id == checkout_id)
+            .first()
+        )
+
+        if not transaction:
+            logger.warning("mpesa_callback: no transaction for CheckoutRequestID=%s", checkout_id)
+            return ack
+
+        # Persist the raw payload and result info
+        transaction.callback_payload = json.dumps(payload)
+        transaction.result_code = str(result_code)
+        transaction.result_desc = result_desc
+
+        if result_code == 0:
+            # ----- SUCCESS -----
+            metadata_items = (
+                stk_callback.get("CallbackMetadata", {}).get("Item", [])
+            )
+            receipt = None
+            amount_paid = None
+            phone_paid = None
+
+            for item in metadata_items:
+                name = item.get("Name")
+                value = item.get("Value")
+                if name == "MpesaReceiptNumber":
+                    receipt = value
+                elif name == "Amount":
+                    amount_paid = value
+                elif name == "PhoneNumber":
+                    phone_paid = str(value) if value else None
+
+            transaction.mpesa_receipt_number = receipt
+            transaction.status = "confirmed"
+            transaction.verified = True
+            if phone_paid:
+                transaction.phone = phone_paid
+
+            logger.info(
+                "mpesa_callback: confirmed. receipt=%s amount=%s phone=%s",
+                receipt,
+                amount_paid,
+                phone_paid,
+            )
+
+        elif result_code == 1032:
+            # ----- CANCELLED by user -----
+            transaction.status = "cancelled"
+            transaction.verified = False
+            logger.info("mpesa_callback: user cancelled. CheckoutRequestID=%s", checkout_id)
+
+        else:
+            # ----- FAILED (wrong PIN, insufficient funds, timeout, etc.) -----
+            transaction.status = "failed"
+            transaction.verified = False
+            logger.warning(
+                "mpesa_callback: failed. code=%s desc=%s", result_code, result_desc
+            )
+
+        db.commit()
+
+    except Exception as exc:
+        logger.exception("mpesa_callback: unexpected error — %s", exc)
+        # Still return ack so Safaricom doesn't retry
+
+    return ack
+
+# ---------------------------------------------------------------------------
+# M-Pesa — Poll status by CheckoutRequestID
+# ---------------------------------------------------------------------------
+
+@api_router.get(
+    "/mpesa/stk-status/{checkout_request_id}",
+    response_model=StkStatusResponse,
+)
+def get_stk_status(
+    checkout_request_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Poll the result of an STK Push by CheckoutRequestID.
+    The frontend should poll this every 3–5 seconds until status is not 'pending'.
+    """
+    transaction = (
+        db.query(Transaction)
+        .filter(
+            Transaction.checkout_request_id == checkout_request_id,
+            Transaction.user_id == current_user.id,
+        )
+        .first()
+    )
+
     if not transaction:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No matching STK Push initiation found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Transaction not found.",
+        )
 
-    transaction.mpesa_receipt_number = receipt
-    transaction.status = "pending"
-    transaction.callback_payload = json.dumps(payload)
-    db.commit()
-    db.refresh(transaction)
+    return StkStatusResponse(
+        transaction_id=transaction.transaction_id,
+        checkout_request_id=checkout_request_id,
+        status=transaction.status,
+        result_code=transaction.result_code,
+        result_desc=transaction.result_desc,
+        mpesa_receipt_number=transaction.mpesa_receipt_number,
+        amount=transaction.amount,
+        verified=transaction.verified,
+    )
 
-    background_tasks.add_task(process_pending_transaction, transaction.transaction_id, payload)
-    return GenericResponse(detail="Callback received and pending verification started.")
+# ---------------------------------------------------------------------------
+# Balance
+# ---------------------------------------------------------------------------
 
 @api_router.get("/user/balance", response_model=BalanceResponse)
-def get_user_balance(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    real_balance, pending_balance, pending_transactions = calculate_balance(db, current_user.id)
+def get_user_balance(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    real_balance, pending_balance, pending_transactions = calculate_balance(
+        db, current_user.id
+    )
     return BalanceResponse(
         real_balance=real_balance,
         pending_balance=pending_balance,
@@ -285,26 +443,61 @@ def get_user_balance(current_user: User = Depends(get_current_user), db: Session
         withdrawal_locked=pending_balance > 0,
     )
 
+# ---------------------------------------------------------------------------
+# Goals
+# ---------------------------------------------------------------------------
+
 @api_router.post("/goals", response_model=GoalRead)
-def create_goal(goal_in: GoalCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def create_goal(
+    goal_in: GoalCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     goal = Goal(**goal_in.dict(), user_id=current_user.id)
     db.add(goal)
     db.commit()
     db.refresh(goal)
     return goal
 
+
 @api_router.get("/goals", response_model=list[GoalRead])
-def list_goals(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    goals = db.query(Goal).filter(Goal.user_id == current_user.id).order_by(Goal.created_at.desc()).all()
-    return goals
+def list_goals(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(Goal)
+        .filter(Goal.user_id == current_user.id)
+        .order_by(Goal.created_at.desc())
+        .all()
+    )
+
+# ---------------------------------------------------------------------------
+# Guardians
+# ---------------------------------------------------------------------------
 
 @api_router.post("/guardians", response_model=GenericResponse)
-async def request_guardian(guardian_in: GuardianCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.phone_number and guardian_in.phone_number == current_user.phone_number:
-        raise HTTPException(status_code=400, detail="You cannot be your own guardian.")
-    
-    # Check if a guardian already exists for this number and user
-    existing = db.query(Guardian).filter(Guardian.user_id == current_user.id, Guardian.phone_number == guardian_in.phone_number).first()
+async def request_guardian(
+    guardian_in: GuardianCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if (
+        current_user.phone_number
+        and guardian_in.phone_number == current_user.phone_number
+    ):
+        raise HTTPException(
+            status_code=400, detail="You cannot be your own guardian."
+        )
+
+    existing = (
+        db.query(Guardian)
+        .filter(
+            Guardian.user_id == current_user.id,
+            Guardian.phone_number == guardian_in.phone_number,
+        )
+        .first()
+    )
     if existing:
         return GenericResponse(detail="Guardian already requested or active.")
 
@@ -313,27 +506,20 @@ async def request_guardian(guardian_in: GuardianCreate, current_user: User = Dep
     db.commit()
     db.refresh(guardian)
 
-    if settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID:
-        whatsapp_payload = {
-            "messaging_product": "whatsapp",
-            "to": guardian.phone_number,
-            "type": "text",
-            "text": {
-                "body": f"Hello {guardian.name}, {current_user.email} has requested you to be their savings guardian on Lovely! As a guardian, you will approve or decline their withdrawal requests. Reply YES to accept."
-            },
-        }
-        async with httpx.AsyncClient() as client:
-            try:
-                await client.post(
-                    f"https://graph.facebook.com/v16.0/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages",
-                    json=whatsapp_payload,
-                    headers={"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}", "Content-Type": "application/json"},
-                    timeout=10,
-                )
-            except Exception:
-                pass
-                
+    # WhatsApp notifications paused — will be re-enabled once WhatsApp API is connected.
+    # TODO: send guardian invite via WhatsApp to guardian.phone_number
+    logger.info(
+        "[WhatsApp PAUSED] Would notify guardian %s (%s) for user %s",
+        guardian.name,
+        guardian.phone_number,
+        current_user.email,
+    )
+
     return GenericResponse(detail="Guardian requested successfully.")
+
+# ---------------------------------------------------------------------------
+# Withdrawals
+# ---------------------------------------------------------------------------
 
 @api_router.post("/withdrawals", response_model=GenericResponse)
 async def create_withdrawal_request(
@@ -343,9 +529,15 @@ async def create_withdrawal_request(
 ):
     real_balance, pending_balance, _ = calculate_balance(db, current_user.id)
     if pending_balance > 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Withdrawals are locked until pending funds are cleared.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Withdrawals are locked until pending deposits are cleared.",
+        )
     if withdrawal.amount > real_balance:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Requested amount exceeds confirmed balance.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Requested amount exceeds your confirmed balance.",
+        )
 
     transaction_id = f"wd_{uuid4().hex}"
     db_transaction = Transaction(
@@ -361,58 +553,63 @@ async def create_withdrawal_request(
     db.add(db_transaction)
     db.commit()
 
-    if settings.WHATSAPP_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID and settings.GUARDIAN_PHONE_NUMBER:
-        whatsapp_payload = {
-            "messaging_product": "whatsapp",
-            "to": settings.GUARDIAN_PHONE_NUMBER,
-            "type": "text",
-            "text": {
-                "body": f"Withdrawal request from {current_user.email}: KES {withdrawal.amount:.2f}. Reason: {withdrawal.reason}. Reply YES to approve."
-            },
-        }
-        async with httpx.AsyncClient() as client:
-            try:
-                await client.post(
-                    f"https://graph.facebook.com/v16.0/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages",
-                    json=whatsapp_payload,
-                    headers={"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}", "Content-Type": "application/json"},
-                    timeout=10,
-                )
-            except Exception:
-                pass
+    # WhatsApp notifications paused — will be re-enabled once WhatsApp API is connected.
+    # TODO: notify guardian via WhatsApp with approval request
+    logger.info(
+        "[WhatsApp PAUSED] Would notify guardian for withdrawal: user=%s amount=%s",
+        current_user.email,
+        withdrawal.amount,
+    )
 
-    return GenericResponse(detail="Withdrawal request sent to guardian via WhatsApp.")
+    return GenericResponse(detail="Withdrawal request submitted. Guardian will be notified once WhatsApp is connected.")
+
+# ---------------------------------------------------------------------------
+# WhatsApp webhook (guardian responses)
+# ---------------------------------------------------------------------------
 
 @api_router.post("/whatsapp/webhook")
 async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.json()
     try:
-        messages = payload.get("entry", [])[0].get("changes", [])[0].get("value", {}).get("messages", [])
+        messages = (
+            payload.get("entry", [])[0]
+            .get("changes", [])[0]
+            .get("value", {})
+            .get("messages", [])
+        )
         if not messages:
             return {"status": "ignored"}
-        
+
         message_body = messages[0].get("text", {}).get("body", "").strip().lower()
         sender_phone = messages[0].get("from", "")
-        
-        # Check if this is a guardian acceptance
+
+        # Guardian acceptance
         if message_body in ["yes", "accept", "y"]:
-            pending_guardian = db.query(Guardian).filter(
-                # We do a basic LIKE match because the from number might have a country code
-                Guardian.phone_number.like(f"%{sender_phone[-9:]}%"),
-                Guardian.status == "pending"
-            ).order_by(Guardian.created_at.desc()).first()
-            
+            pending_guardian = (
+                db.query(Guardian)
+                .filter(
+                    Guardian.phone_number.like(f"%{sender_phone[-9:]}%"),
+                    Guardian.status == "pending",
+                )
+                .order_by(Guardian.created_at.desc())
+                .first()
+            )
             if pending_guardian:
                 pending_guardian.status = "accepted"
                 db.commit()
                 return {"status": "guardian accepted"}
-        
-        # Check if it's a withdrawal approval
-        pending_withdrawal = db.query(Transaction).filter(
-            Transaction.type == "withdrawal",
-            Transaction.status == "pending_approval"
-        ).order_by(Transaction.created_at.desc()).first()
-        
+
+        # Withdrawal approval / decline
+        pending_withdrawal = (
+            db.query(Transaction)
+            .filter(
+                Transaction.type == "withdrawal",
+                Transaction.status == "pending_approval",
+            )
+            .order_by(Transaction.created_at.desc())
+            .first()
+        )
+
         if pending_withdrawal:
             if message_body in ["yes", "approve", "y"]:
                 pending_withdrawal.status = "confirmed"
@@ -425,32 +622,21 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 pending_withdrawal.guardian_approved = "declined"
                 db.commit()
                 return {"status": "withdrawal declined"}
-            
+
     except Exception:
         pass
-    
+
     return {"status": "ok"}
 
-async def process_all_pending_transactions() -> int:
-    db = SessionLocal()
-    try:
-        pending_transactions = db.query(Transaction).filter(
-            Transaction.type == "deposit",
-            Transaction.status == "pending", 
-            Transaction.verified == False
-        ).all()
-        for transaction in pending_transactions:
-            await process_pending_transaction(transaction.transaction_id)
-        return len(pending_transactions)
-    finally:
-        db.close()
+# ---------------------------------------------------------------------------
+# Transaction listing (admin/debug)
+# ---------------------------------------------------------------------------
 
-@api_router.post("/mpesa/process-pending", response_model=GenericResponse)
-async def process_pending_transactions(db: Session = Depends(get_db)):
-    count = await process_all_pending_transactions()
-    return GenericResponse(detail=f"Processed {count} pending transactions.")
-
-@api_router.post("/transactions", response_model=TransactionRead, status_code=status.HTTP_201_CREATED)
+@api_router.post(
+    "/transactions",
+    response_model=TransactionRead,
+    status_code=status.HTTP_201_CREATED,
+)
 def create_transaction(transaction: TransactionCreate, db: Session = Depends(get_db)):
     db_transaction = Transaction(**transaction.dict())
     db.add(db_transaction)
@@ -465,7 +651,15 @@ def create_transaction(transaction: TransactionCreate, db: Session = Depends(get
         )
     return db_transaction
 
+
 @api_router.get("/transactions", response_model=list[TransactionRead])
-def list_transactions(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
-    transactions = db.query(Transaction).order_by(Transaction.created_at.desc()).offset(skip).limit(limit).all()
-    return transactions
+def list_transactions(
+    skip: int = 0, limit: int = 50, db: Session = Depends(get_db)
+):
+    return (
+        db.query(Transaction)
+        .order_by(Transaction.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )

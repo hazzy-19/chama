@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthContext } from "../context/AuthContext";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { LogOut, ShieldCheck, Wallet, ArrowUpRight, ArrowDownLeft, Activity, Info, Clock, AlertCircle, X, Plus, Calendar as CalendarIcon, ChevronDown, Heart } from "lucide-react";
 import { toast } from "sonner";
 import { logOut } from "../services/firebase";
-import { fetchBalance, initiateTopUp, requestWithdrawal, fetchGoals } from "../services/api";
+import { fetchBalance, initiateTopUp, requestWithdrawal, fetchGoals, pollStkStatus } from "../services/api";
 import { StartGoalModal } from "./modals/StartGoalModal";
 import clsx from "clsx";
 
@@ -55,25 +55,56 @@ const Dashboard = () => {
   const [requestReason, setRequestReason] = useState("");
   const [depositAmount, setDepositAmount] = useState<number | "">("");
   const [depositPhone, setDepositPhone] = useState("");
+  const [activeStkPushId, setActiveStkPushId] = useState<string | null>(null);
   
   const showVerificationBanner = user && !user.emailVerified && !verificationBannerDismissed && !user.email?.endsWith("@lovely.app");
 
-  const { data: balanceData, isLoading: isBalanceLoading, isFetching: isBalanceFetching } = useQuery({
+  const { data: balanceData, isLoading: isBalanceLoading, isFetching: isBalanceFetching, isError: isBalanceError } = useQuery({
     queryKey: ["balance"],
     queryFn: fetchBalance,
-    refetchInterval: 30000,
+    refetchInterval: (query) => {
+      const data = query.state?.data as any;
+      if (data?.pending_transactions?.length > 0) return 5000;
+      return false;
+    },
   });
 
-  const { data: goalsData, isLoading: isGoalsLoading } = useQuery({
+  const { data: goalsData, isLoading: isGoalsLoading, isError: isGoalsError } = useQuery({
     queryKey: ["goals"],
     queryFn: fetchGoals,
   });
 
+  const { data: stkData } = useQuery({
+    queryKey: ["stk_status", activeStkPushId],
+    queryFn: () => pollStkStatus(activeStkPushId!),
+    enabled: !!activeStkPushId,
+    refetchInterval: (query) => {
+      const data = query.state?.data as any;
+      if (data && data.status !== "pending") return false; // Stop polling once resolved
+      return 2000; // Poll every 2 seconds
+    },
+  });
+
+  useEffect(() => {
+    if (stkData && stkData.status !== "pending" && activeStkPushId) {
+      if (stkData.status === "confirmed") {
+        toast.success(`Deposit successful: KES ${stkData.amount}`);
+      } else {
+        toast.error(`Deposit failed: ${stkData.result_desc || "Cancelled"}`);
+      }
+      setActiveStkPushId(null);
+      queryClient.invalidateQueries({ queryKey: ["balance"] });
+    }
+  }, [stkData, activeStkPushId, queryClient]);
+
   const topUpMutation = useMutation({
     mutationFn: ({ amount, phone }: { amount: number; phone: string }) => initiateTopUp(amount, phone),
-    onSuccess: () => {
+    onSuccess: (data) => {
       toast.success("STK Push initiated! Please check your phone.");
       setDepositAmount("");
+      if (data?.checkout_request_id) {
+        setActiveStkPushId(data.checkout_request_id);
+      }
       queryClient.invalidateQueries({ queryKey: ["balance"] });
     },
     onError: (error: Error) => toast.error(error.message),
@@ -116,8 +147,8 @@ const Dashboard = () => {
     withdrawMutation.mutate({ amount, reason: requestReason });
   };
 
-  const goals = (goalsData as Goal[]) || [];
-  const selectedGoal = goals.find(g => g.id === selectedGoalId) || goals[0] || null;
+  const goals: Goal[] = Array.isArray(goalsData) ? goalsData : [];
+  const selectedGoal = goals.find(g => g.id === selectedGoalId) ?? goals[0] ?? null;
   const activeColorTheme = selectedGoal?.color_theme || "teal";
   const bgClass = THEME_BG[activeColorTheme] || THEME_BG.teal;
   const textClass = THEME_TEXT[activeColorTheme] || THEME_TEXT.teal;
@@ -155,6 +186,25 @@ const Dashboard = () => {
               >
                 <X className="w-4 h-4" />
               </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Network Error Banner */}
+      <AnimatePresence>
+        {(isBalanceError || isGoalsError) && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="bg-rose-50 border-b border-rose-200"
+          >
+            <div className="max-w-7xl mx-auto px-6 py-3 flex items-center gap-3">
+              <AlertCircle className="w-5 h-5 text-rose-600 flex-shrink-0" />
+              <p className="text-sm text-rose-800 font-medium flex-1">
+                Unable to load your latest data. Please check your connection or try again later.
+              </p>
             </div>
           </motion.div>
         )}

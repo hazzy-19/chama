@@ -12,78 +12,85 @@ async function getAuthHeaders() {
   };
 }
 
-export async function fetchBalance() {
-  const headers = await getAuthHeaders();
-  const res = await fetch(`${API_BASE}/api/v1/user/balance`, { headers });
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({}));
-    throw new Error(error.detail || "Unable to load balance.");
+/** Safe JSON parser — never throws on empty or non-JSON responses. */
+async function safeJson(res: Response): Promise<any> {
+  const text = await res.text();
+  if (!text || text.trim() === "") return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { detail: text };
   }
-  return res.json();
+}
+
+/** Centralized fetch wrapper to handle auth tokens and global 401 redirects */
+async function fetchApi(endpoint: string, options: RequestInit = {}) {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_BASE}${endpoint}`, {
+    ...options,
+    headers: { ...headers, ...options.headers },
+  });
+
+  if (res.status === 401) {
+    // Token is invalid/expired — clear session and force re-login
+    await auth.signOut();
+    window.location.href = "/auth?mode=signin";
+    throw new Error("Session expired. Please log in again.");
+  }
+
+  const data = await safeJson(res);
+  
+  if (!res.ok) {
+    throw new Error(data.detail || "An unexpected error occurred.");
+  }
+  
+  return data;
+}
+
+export async function fetchBalance() {
+  return fetchApi("/api/v1/user/balance");
 }
 
 export async function initiateTopUp(amount: number, phone: string) {
-  const headers = await getAuthHeaders();
-  const res = await fetch(`${API_BASE}/api/v1/mpesa/initiate`, {
+  return fetchApi("/api/v1/mpesa/initiate", {
     method: "POST",
-    headers,
     body: JSON.stringify({ amount, phone, description: "Savings deposit" }),
   });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.detail || "Unable to initiate STK Push.");
-  }
-  return data;
+}
+
+export async function pollStkStatus(checkoutRequestId: string) {
+  return fetchApi(`/api/v1/mpesa/stk-status/${checkoutRequestId}`);
 }
 
 export async function requestWithdrawal(amount: number, reason: string) {
-  const headers = await getAuthHeaders();
-  const res = await fetch(`${API_BASE}/api/v1/withdrawals`, {
+  return fetchApi("/api/v1/withdrawals", {
     method: "POST",
-    headers,
     body: JSON.stringify({ amount, reason }),
   });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.detail || "Unable to submit withdrawal request.");
-  }
-  return data;
 }
 
 export async function fetchGoals() {
-  const headers = await getAuthHeaders();
-  const res = await fetch(`${API_BASE}/api/v1/goals`, { headers });
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({}));
-    throw new Error(error.detail || "Unable to load goals.");
-  }
-  return res.json();
+  return fetchApi("/api/v1/goals");
 }
 
-export async function createGoal(goalData: { name: string; target_amount: number; target_date: string; color_theme: string }) {
-  const headers = await getAuthHeaders();
-  const res = await fetch(`${API_BASE}/api/v1/goals`, {
+export async function createGoal(goalData: {
+  name: string;
+  target_amount: number;
+  target_date: string;
+  color_theme: string;
+}) {
+  return fetchApi("/api/v1/goals", {
     method: "POST",
-    headers,
     body: JSON.stringify(goalData),
   });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.detail || "Unable to create goal.");
-  }
-  return data;
 }
 
-export async function requestGuardian(guardianData: { name: string; phone_number: string }) {
-  const headers = await getAuthHeaders();
-  const res = await fetch(`${API_BASE}/api/v1/guardians`, {
+export async function requestGuardian(guardianData: {
+  name: string;
+  phone_number: string;
+}) {
+  return fetchApi("/api/v1/guardians", {
     method: "POST",
-    headers,
     body: JSON.stringify(guardianData),
   });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.detail || "Unable to request guardian.");
-  }
-  return data;
 }
